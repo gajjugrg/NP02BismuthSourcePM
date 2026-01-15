@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# Outputs / caches
+plots/
+plots_*/
+plots*/
+*.pkl
+*.pickle
+fit_cache*.json
+fit_cache*.pkl
+
+# Keep old experiments local-only
+legacy/
+
+# Optional local config
+.env
