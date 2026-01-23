@@ -16,12 +16,20 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from scipy.optimize import curve_fit
+from tp.tp_cb_core import (
+    crystal_ball,
+    fit_crystal_ball,
+    fit_gaussian,
+    gaussian,
+    iter_measurement_dirs,
+    load_histogram,
+    parse_timestamp,
+)
 
 NP02DATA_DIR = os.environ.get('NP02DATA_DIR', '../np02data')
 ROOT_DIR = NP02DATA_DIR
 PLOTS_DIR = 'plots'
-PLOT_START = datetime(2025, 11, 21, 16, 00)
+PLOT_START = datetime(2026, 1, 22, 16, 0)
 PLOT_END = None
 MV_SCALE = 1000.0  # volts to millivolts
 TEMP_CSV_PATH = os.environ.get('NP02_TEMP_CSV', os.path.join(NP02DATA_DIR, 'Temp.csv'))
@@ -94,114 +102,18 @@ def _to_millivolts_scalar(value_v: Optional[float]) -> Optional[float]:
     return value_v * MV_SCALE
 
 
-def crystal_ball(x, amplitude, mean, sigma, alpha, n):
-    """Crystal Ball lineshape with stable tail evaluation."""
-    t = (x - mean) / sigma
-    abs_alpha = np.abs(alpha)
-    A = (n / abs_alpha) ** n * np.exp(-0.5 * abs_alpha * abs_alpha)
-    B = n / abs_alpha - abs_alpha
-    result = np.empty_like(t, dtype=float)
-    core_mask = t > -abs_alpha
-    tail_mask = ~core_mask
-    result[core_mask] = np.exp(-0.5 * t[core_mask] * t[core_mask])
-    if np.any(tail_mask):
-        denom = np.maximum(B - t[tail_mask], 1e-12)
-        result[tail_mask] = A * denom ** (-n)
-    return amplitude * result
-
-
-def gaussian(x, amplitude, mean, sigma):
-    return amplitude * np.exp(-0.5 * ((x - mean) / sigma) ** 2)
-
-
-def _fit_cb_curve(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[float, float, float, float, float], Optional[np.ndarray]]]:
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.size < 3 or np.allclose(y, 0):
+def _fit_cb_curve(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[float, float, float, float, float], Optional[np.ndarray]]]:
+    """Back-compat wrapper for older call sites within this file."""
+    res = fit_crystal_ball(x, y)
+    if res is None:
         return None
-    peak_idx = int(np.argmax(y))
-    amplitude0 = max(float(y[peak_idx]), 1e-6)
-    sigma0 = max((x.max() - x.min()) / 6.0, 1e-3)
-    mean0 = float(x[peak_idx])
-    alpha0 = 1.5
-    n0 = 3.0
-    lower = [0.0, x.min(), 1e-5, 0.1, 0.5]
-    upper = [np.inf, x.max(), (x.max() - x.min()) * 2.0, 10.0, 50.0]
-    try:
-        popt, pcov = curve_fit(
-            crystal_ball,
-            x,
-            y,
-            p0=[amplitude0, mean0, sigma0, alpha0, n0],
-            bounds=(lower, upper),
-            maxfev=40000,
-        )
-    except Exception:
-        return None
-    x_fit = np.linspace(x.min(), x.max(), 400)
+    popt, pcov = res
+    x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 400)
     y_fit = crystal_ball(x_fit, *popt)
-    return x_fit, y_fit, tuple(popt), pcov
-
-
-MONTH_MAP = {
-    'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
-    'May': '05', 'Jun': '06', 'Jul': '07', 'Aug': '08',
-    'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12'
-}
-
-
-def iter_measurement_dirs(root_dir: str):
-    seen = set()
-    pattern = f"{root_dir}/20??_[A-Za-z][a-z][a-z]/**/F1.txt"
-    for f1_path in glob.iglob(pattern, recursive=True):
-        directory = os.path.dirname(f1_path)
-        if directory in seen:
-            continue
-        seen.add(directory)
-        yield directory
-
-
-def parse_timestamp(directory: str) -> Optional[datetime]:
-    parts = directory.strip('/').split('/')
-    idx = None
-    for i, part in enumerate(parts):
-        if re.fullmatch(r"\d{4}_[A-Za-z]{3}", part):
-            idx = i
-            break
-    if idx is None or len(parts) <= idx + 3:
-        return None
-    year_month = parts[idx]
-    day = parts[idx + 1]
-    hour = parts[idx + 2]
-    minute = parts[idx + 3]
-    second = parts[idx + 4] if len(parts) > idx + 4 else '00'
-    year_str, month_word = year_month.split('_', 1)
-    month_str = MONTH_MAP.get(month_word.capitalize())
-    if month_str is None:
-        return None
-    try:
-        timestamp = datetime.strptime(
-            f"{year_str}-{month_str}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(second):02d}",
-            '%Y-%m-%d %H:%M:%S'
-        )
-    except ValueError:
-        return None
-    return timestamp
-
-
-def load_histogram(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_csv(path, usecols=['BinCenter', 'Population'])
-    except Exception:
-        return None
-    df = df.apply(pd.to_numeric, errors='coerce')
-    df = df.dropna(subset=['BinCenter', 'Population'])
-    if df.empty:
-        return None
-    return df.sort_values('BinCenter').reset_index(drop=True)
+    return x_fit, y_fit, popt, pcov
 
 
 MeanWithErr = Tuple[float, Optional[float]]
@@ -319,29 +231,12 @@ def _plot_low_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[flo
 
 
 def _fit_f3_peak(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, float, Optional[float]]]:
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.size < 3 or np.allclose(y, 0):
+    res = fit_gaussian(x, y)
+    if res is None:
         return None
-    peak_idx = int(np.argmax(y))
-    amp0 = max(float(y[peak_idx]), 1e-6)
-    mean0 = float(x[peak_idx])
-    sigma0 = max((x.max() - x.min()) / 6.0, 1e-4)
-    try:
-        popt, pcov = curve_fit(
-            gaussian,
-            x,
-            y,
-            p0=[amp0, mean0, sigma0],
-            bounds=([0.0, x.min(), 1e-6], [np.inf, x.max(), (x.max() - x.min()) * 2.0]),
-            maxfev=20000,
-        )
-    except Exception:
-        return None
-    x_fit = np.linspace(x.min(), x.max(), 400)
-    y_fit = gaussian(x_fit, *popt)
-    _, mean, _ = popt
+    (amp, mean, sigma), pcov = res
+    x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 400)
+    y_fit = gaussian(x_fit, amp, mean, sigma)
     mean_err = float(np.sqrt(pcov[1, 1])) if pcov is not None and pcov.shape[0] > 1 else None
     return x_fit, y_fit, mean, mean_err
 

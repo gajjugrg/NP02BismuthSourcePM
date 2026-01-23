@@ -35,7 +35,15 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit
+from tp.tp_cb_core import (
+    crystal_ball,
+    fit_crystal_ball,
+    fit_gaussian,
+    gaussian,
+    iter_measurement_dirs,
+    load_histogram,
+    parse_timestamp,
+)
 
 
 ROOT_DIR_DEFAULT = os.environ.get("NP02DATA_DIR", "../np02data")
@@ -66,22 +74,6 @@ FILES = {
     "F3": "F3.txt",
 }
 
-MONTH_MAP = {
-    "Jan": "01",
-    "Feb": "02",
-    "Mar": "03",
-    "Apr": "04",
-    "May": "05",
-    "Jun": "06",
-    "Jul": "07",
-    "Aug": "08",
-    "Sep": "09",
-    "Oct": "10",
-    "Nov": "11",
-    "Dec": "12",
-}
-
-
 def _parse_datetime(dt_str: str) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -91,139 +83,6 @@ def _parse_datetime(dt_str: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-def iter_measurement_dirs(root_dir: str) -> Iterator[str]:
-    seen = set()
-    pattern = f"{root_dir}/20??_[A-Za-z][a-z][a-z]/**/F1.txt"
-    for f1_path in glob.iglob(pattern, recursive=True):
-        directory = os.path.dirname(f1_path)
-        if directory in seen:
-            continue
-        seen.add(directory)
-        yield directory
-
-
-def parse_timestamp(directory: str) -> Optional[datetime]:
-    parts = directory.strip("/").split("/")
-    idx = None
-    for i, part in enumerate(parts):
-        if re.fullmatch(r"\d{4}_[A-Za-z]{3}", part):
-            idx = i
-            break
-    if idx is None or len(parts) <= idx + 3:
-        return None
-
-    year_month = parts[idx]
-    day = parts[idx + 1]
-    hour = parts[idx + 2]
-    minute = parts[idx + 3]
-    second = parts[idx + 4] if len(parts) > idx + 4 else "00"
-
-    year_str, month_word = year_month.split("_", 1)
-    month_str = MONTH_MAP.get(month_word.capitalize())
-    if month_str is None:
-        return None
-
-    try:
-        return datetime.strptime(
-            f"{year_str}-{month_str}-{int(day):02d} {int(hour):02d}:{int(minute):02d}:{int(second):02d}",
-            "%Y-%m-%d %H:%M:%S",
-        )
-    except ValueError:
-        return None
-
-
-def load_histogram(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_csv(path, usecols=["BinCenter", "Population"])
-    except Exception:
-        return None
-    df = df.apply(pd.to_numeric, errors="coerce")
-    df = df.dropna(subset=["BinCenter", "Population"])
-    if df.empty:
-        return None
-    return df.sort_values("BinCenter").reset_index(drop=True)
-
-
-def crystal_ball(x: np.ndarray, amplitude: float, mean: float, sigma: float, alpha: float, n: float) -> np.ndarray:
-    t = (x - mean) / sigma
-    abs_alpha = np.abs(alpha)
-    A = (n / abs_alpha) ** n * np.exp(-0.5 * abs_alpha * abs_alpha)
-    B = n / abs_alpha - abs_alpha
-    result = np.empty_like(t, dtype=float)
-    core_mask = t > -abs_alpha
-    tail_mask = ~core_mask
-    result[core_mask] = np.exp(-0.5 * t[core_mask] * t[core_mask])
-    if np.any(tail_mask):
-        denom = np.maximum(B - t[tail_mask], 1e-12)
-        result[tail_mask] = A * denom ** (-n)
-    return amplitude * result
-
-
-def gaussian(x: np.ndarray, amplitude: float, mean: float, sigma: float) -> np.ndarray:
-    return amplitude * np.exp(-0.5 * ((x - mean) / sigma) ** 2)
-
-
-def _fit_cb_curve(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[Tuple[float, float, float, float, float], Optional[np.ndarray]]]:
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.size < 3 or np.allclose(y, 0):
-        return None
-
-    peak_idx = int(np.argmax(y))
-    amplitude0 = max(float(y[peak_idx]), 1e-6)
-    sigma0 = max((x.max() - x.min()) / 6.0, 1e-3)
-    mean0 = float(x[peak_idx])
-    alpha0 = 1.5
-    n0 = 3.0
-
-    lower = [0.0, float(x.min()), 1e-5, 0.1, 0.5]
-    upper = [np.inf, float(x.max()), float((x.max() - x.min()) * 2.0), 10.0, 50.0]
-
-    try:
-        popt, pcov = curve_fit(
-            crystal_ball,
-            x,
-            y,
-            p0=[amplitude0, mean0, sigma0, alpha0, n0],
-            bounds=(lower, upper),
-            maxfev=40000,
-        )
-    except Exception:
-        return None
-
-    return (float(popt[0]), float(popt[1]), float(popt[2]), float(popt[3]), float(popt[4])), pcov
-
-
-def _fit_f3_params(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[Tuple[float, float, float], Optional[np.ndarray]]]:
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.size < 3 or np.allclose(y, 0):
-        return None
-
-    peak_idx = int(np.argmax(y))
-    amp0 = max(float(y[peak_idx]), 1e-6)
-    mean0 = float(x[peak_idx])
-    sigma0 = max(float((x.max() - x.min()) / 6.0), 1e-4)
-
-    try:
-        popt, pcov = curve_fit(
-            gaussian,
-            x,
-            y,
-            p0=[amp0, mean0, sigma0],
-            bounds=([0.0, float(x.min()), 1e-6], [np.inf, float(x.max()), float((x.max() - x.min()) * 2.0)]),
-            maxfev=20000,
-        )
-    except Exception:
-        return None
-
-    return (float(popt[0]), float(popt[1]), float(popt[2])), pcov
 
 
 def _fit_f3_peak(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, Optional[float]]]:
@@ -306,7 +165,7 @@ def compute_means(series: Dict[str, pd.DataFrame]) -> Dict[str, FitResult]:
                 fit_x = x[narrow_mask]
                 fit_y = y[narrow_mask]
 
-        fit = _fit_cb_curve(fit_x, fit_y)
+        fit = fit_crystal_ball(fit_x, fit_y)
         if fit is None:
             continue
         popt, pcov = fit
@@ -336,7 +195,7 @@ def compute_means(series: Dict[str, pd.DataFrame]) -> Dict[str, FitResult]:
         x = v[mask]
         y = c[mask]
 
-        fit = _fit_cb_curve(x, y)
+        fit = fit_crystal_ball(x, y)
         if fit is None:
             continue
         popt, pcov = fit
@@ -348,8 +207,6 @@ def compute_means(series: Dict[str, pd.DataFrame]) -> Dict[str, FitResult]:
             mean_mV = _to_millivolts_scalar(mean)
             if mean_mV is not None and mean_mV < 600.0:
                 continue
-
-        out[f"{label}_low"] = FitResult(mean_v=mean, err_v=mean_err)
 
         out[f"{label}_low"] = FitResult(
             mean_v=mean,
@@ -367,7 +224,7 @@ def compute_means(series: Dict[str, pd.DataFrame]) -> Dict[str, FitResult]:
     if df3 is not None and not df3.empty:
         x3 = df3["BinCenter"].to_numpy(dtype=float)
         y3 = df3["Population"].to_numpy(dtype=float)
-        fit3 = _fit_f3_params(x3, y3)
+        fit3 = fit_gaussian(x3, y3)
         if fit3 is not None:
             popt3, pcov3 = fit3
             mean = float(popt3[1])
