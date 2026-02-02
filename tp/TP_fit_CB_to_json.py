@@ -19,6 +19,15 @@ Notes:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Allow running this script directly (e.g. `python tp/TP_fit_CB_to_json.py`) by ensuring
+# the `src/` directory is on sys.path so `import tp.*` works.
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 import argparse
 import glob
 import json
@@ -42,11 +51,12 @@ from tp.tp_cb_core import (
     gaussian,
     iter_measurement_dirs,
     load_histogram,
+    load_record_series,
     parse_timestamp,
 )
 
-
-ROOT_DIR_DEFAULT = os.environ.get("NP02DATA_DIR", "../np02data")
+_REPO_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR_DEFAULT = os.environ.get("NP02DATA_DIR", str(_REPO_DIR / "np02data"))
 PLOTS_DIR_DEFAULT = "plots"
 JSON_OUT_DEFAULT = os.path.join(PLOTS_DIR_DEFAULT, "tp_cb_fit_results.json")
 PLOT_START = datetime(2025, 11, 21, 16, 00)
@@ -83,35 +93,6 @@ def _parse_datetime(dt_str: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-def _fit_f3_peak(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, Optional[float]]]:
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.size < 3 or np.allclose(y, 0):
-        return None
-
-    peak_idx = int(np.argmax(y))
-    amp0 = max(float(y[peak_idx]), 1e-6)
-    mean0 = float(x[peak_idx])
-    sigma0 = max(float((x.max() - x.min()) / 6.0), 1e-4)
-
-    try:
-        popt, pcov = curve_fit(
-            gaussian,
-            x,
-            y,
-            p0=[amp0, mean0, sigma0],
-            bounds=([0.0, float(x.min()), 1e-6], [np.inf, float(x.max()), float((x.max() - x.min()) * 2.0)]),
-            maxfev=20000,
-        )
-    except Exception:
-        return None
-
-    mean = float(popt[1])
-    mean_err = float(np.sqrt(pcov[1, 1])) if pcov is not None and pcov.shape[0] > 1 else None
-    return mean, mean_err
 
 
 def _mean_err_from_pcov(pcov: Optional[np.ndarray], mean_index: int) -> Optional[float]:
@@ -445,13 +426,13 @@ def main() -> None:
     if not isinstance(measurements, dict):
         measurements = {}
 
-    directories = sorted(iter_measurement_dirs(args.root_dir))
+    measurement_paths = sorted(iter_measurement_dirs(args.root_dir))
 
     processed = 0
     skipped = 0
     try:
-        for directory in directories:
-            ts = parse_timestamp(directory)
+        for measurement in measurement_paths:
+            ts = parse_timestamp(measurement)
             if ts is None:
                 continue
             if start and ts < start:
@@ -465,10 +446,13 @@ def main() -> None:
                 continue
 
             series: Dict[str, pd.DataFrame] = {}
-            for label, fname in FILES.items():
-                df = load_histogram(os.path.join(directory, fname))
-                if df is not None:
-                    series[label] = df
+            if os.path.isfile(measurement) and os.path.basename(measurement).startswith("Record_") and measurement.lower().endswith(".csv"):
+                series = load_record_series(measurement)
+            else:
+                for label, fname in FILES.items():
+                    df = load_histogram(os.path.join(measurement, fname))
+                    if df is not None:
+                        series[label] = df
             if not series:
                 continue
 

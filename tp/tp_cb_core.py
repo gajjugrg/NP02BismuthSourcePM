@@ -15,7 +15,7 @@ import glob
 import os
 import re
 from datetime import datetime
-from typing import Iterator, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,10 +50,26 @@ def _parse_datetime(dt_str: str) -> Optional[datetime]:
 
 
 def iter_measurement_dirs(root_dir: str) -> Iterator[str]:
-    """Yield measurement directories that contain an `F1.txt` histogram."""
-    seen = set()
-    pattern = f"{root_dir}/20??_[A-Za-z][a-z][a-z]/**/F1.txt"
-    for f1_path in glob.iglob(pattern, recursive=True):
+    """Yield measurement locations under `root_dir`.
+
+    Supports two layouts:
+    - New (2026+): Record_YYYY_Mmm_DD_HH_MM.csv files containing columns binCenter, F1..F4
+    - Legacy: directories containing histogram files like F1.txt, F2.txt, ...
+    """
+
+    seen: set[str] = set()
+
+    # New layout: Record_*.csv
+    record_pattern = f"{root_dir}/**/Record_*.csv"
+    for record_path in glob.iglob(record_pattern, recursive=True):
+        if record_path in seen:
+            continue
+        seen.add(record_path)
+        yield record_path
+
+    # Legacy layout: .../F1.txt
+    legacy_pattern = f"{root_dir}/20??_[A-Za-z][a-z][a-z]/**/F1.txt"
+    for f1_path in glob.iglob(legacy_pattern, recursive=True):
         directory = os.path.dirname(f1_path)
         if directory in seen:
             continue
@@ -61,9 +77,29 @@ def iter_measurement_dirs(root_dir: str) -> Iterator[str]:
         yield directory
 
 
-def parse_timestamp(directory: str) -> Optional[datetime]:
-    """Extract timestamp from directory structure: YYYY_Mmm/DD/HH/MM/(SS optional)."""
-    parts = directory.strip("/").split("/")
+def parse_timestamp(measurement: str) -> Optional[datetime]:
+    """Extract measurement timestamp.
+
+    - New layout: Record_YYYY_Mmm_DD_HH_MM.csv (seconds assumed 00)
+    - Legacy layout: directory structure YYYY_Mmm/DD/HH/MM/(SS optional)
+    """
+
+    base = os.path.basename(measurement)
+    m = re.fullmatch(r"Record_(\d{4})_([A-Za-z]{3})_(\d{2})_(\d{2})_(\d{2})\.csv", base)
+    if m:
+        year_str, month_word, day_str, hour_str, minute_str = m.groups()
+        month_str = MONTH_MAP.get(month_word.capitalize())
+        if month_str is None:
+            return None
+        try:
+            return datetime.strptime(
+                f"{year_str}-{month_str}-{int(day_str):02d} {int(hour_str):02d}:{int(minute_str):02d}:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+        except ValueError:
+            return None
+
+    parts = measurement.strip("/").split("/")
     idx = None
     for i, part in enumerate(parts):
         if re.fullmatch(r"\d{4}_[A-Za-z]{3}", part):
@@ -90,6 +126,53 @@ def parse_timestamp(directory: str) -> Optional[datetime]:
         )
     except ValueError:
         return None
+
+
+def load_record_series(
+    record_csv_path: str,
+    *,
+    channels: Tuple[str, ...] = ("F1", "F2", "F3", "F4"),
+) -> Dict[str, pd.DataFrame]:
+    """Load a Record_*.csv file into per-channel histogram DataFrames.
+
+    Expected columns:
+    - binCenter (volts)
+    - F1, F2, F3, F4 (counts; some channels may be empty)
+
+    Returns a dict mapping channel name -> DataFrame with columns BinCenter, Population.
+    """
+    if not os.path.exists(record_csv_path):
+        return {}
+    try:
+        df = pd.read_csv(record_csv_path)
+    except Exception:
+        return {}
+
+    if df.empty:
+        return {}
+
+    # Normalize bin center column name.
+    bin_col = None
+    for candidate in ("binCenter", "BinCenter", "bin_center", "BIN_CENTER"):
+        if candidate in df.columns:
+            bin_col = candidate
+            break
+    if bin_col is None:
+        return {}
+
+    out: Dict[str, pd.DataFrame] = {}
+    bin_vals = pd.to_numeric(df[bin_col], errors="coerce")
+
+    for ch in channels:
+        if ch not in df.columns:
+            continue
+        counts = pd.to_numeric(df[ch], errors="coerce")
+        ch_df = pd.DataFrame({"BinCenter": bin_vals, "Population": counts}).dropna(subset=["BinCenter", "Population"])
+        if ch_df.empty:
+            continue
+        out[ch] = ch_df.sort_values("BinCenter").reset_index(drop=True)
+
+    return out
 
 
 def load_histogram(path: str) -> Optional[pd.DataFrame]:

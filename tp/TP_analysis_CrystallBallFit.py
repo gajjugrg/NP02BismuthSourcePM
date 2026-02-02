@@ -1,10 +1,46 @@
+"""Test Pulse (TP) analysis with Crystal Ball fits.
+
+This is a *script* (not a library module). It scans TP histogram measurements,
+fits peak means, and produces both per-measurement plots and a mean-vs-time plot.
+
+Supported input layouts
+-----------------------
+1) New (2026+): single CSV per measurement
+     - File name encodes time: Record_<YEAR>_<MONTH>_<DAY>_<HOUR>_<MINUTE>.csv
+         Example: Record_2026_Jan_24_07_32.csv
+     - Columns: binCenter, F1, F2, F3, F4 (F4 may be empty)
+
+2) Legacy: one directory per measurement containing histogram files
+     - F1.txt, F2.txt, F3.txt (etc.) with columns BinCenter, Population
+
+Fit model summary
+-----------------
+- F1/F2 ("TP response", high region): Crystal Ball fit above 1.2 V.
+    For F1 a narrow window around the peak is used for stability.
+- F1/F2 ("purity monitor", low region): Crystal Ball fit in LOW_V_MIN..LOW_V_MAX.
+    F2 low fits with mean < 600 mV are rejected (noise/failed fits).
+- F3 ("test pulse"): Gaussian fit.
+
+Outputs (written under PLOTS_DIR)
+--------------------------------
+- split_low_cb_<timestamp>.png : per-measurement 3-panel plot (high/low/F3)
+- fit_means_vs_time.png        : stacked time-series of fitted means
+- fit_means_data_low_cb.csv    : CSV dump of the fitted mean values
+
+Controlling the time window
+---------------------------
+- TP_PLOT_START / TP_PLOT_END (env vars) override PLOT_START/PLOT_END.
+    Format: YYYY-MM-DD HH:MM[:SS]
+- TP_SHOW=1 shows figures interactively (otherwise saves PNGs only).
 """
-Variant of TP_analysis that treats the low-voltage region differently:
-- No F1/F2 scaling/subtraction in the low region
-- Fit Crystal Ball functions to F1 and F2 in 0.4- 1.2 V
-- Split plots show F1/F2 high, F1/F2 low (raw), and F3 as before
-- Time plot shows F1_high, F2_high, combined low (<1.2 V) for F1 and F2, and F3
-"""
+import sys
+from pathlib import Path
+
+# Allow running this script directly (e.g. `python tp/TP_analysis_CrystallBallFit.py`) by ensuring
+# the `src/` directory is on sys.path so `import tp.*` works.
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 import os
 import glob
 import re
@@ -23,16 +59,22 @@ from tp.tp_cb_core import (
     gaussian,
     iter_measurement_dirs,
     load_histogram,
+    load_record_series,
     parse_timestamp,
 )
 
-NP02DATA_DIR = os.environ.get('NP02DATA_DIR', '../np02data')
+_REPO_DIR = Path(__file__).resolve().parents[2]
+
+# Root directory containing measurements.
+# - If NP02DATA_DIR is set, it is used directly.
+# - Otherwise default to <repo>/np02data so the script works when run from repo root.
+NP02DATA_DIR = os.environ.get('NP02DATA_DIR', str(_REPO_DIR / 'np02data'))
 ROOT_DIR = NP02DATA_DIR
-PLOTS_DIR = 'plots'
-PLOT_START = datetime(2026, 1, 22, 16, 0)
+PLOTS_DIR = 'plots_scope'
+PLOT_START = datetime(2026, 1, 24, 7, 0)
 PLOT_END = None
 MV_SCALE = 1000.0  # volts to millivolts
-TEMP_CSV_PATH = os.environ.get('NP02_TEMP_CSV', os.path.join(NP02DATA_DIR, 'Temp.csv'))
+TEMP_CSV_PATH = os.environ.get('NP02_TEMP_CSV', os.path.join(NP02DATA_DIR, 'Temp_Jan26.csv'))
 LOW_V_MIN = 0.55
 LOW_V_MAX = 1.2
 HIGH_FIT_WINDOW_F1 = 0.10  # V window around F1 high peak for CB fit
@@ -56,8 +98,9 @@ DESCRIPTIONS = {
 }
 
 DATA_LABELS = {
+    # These names are used for the CSV header in write_plot_data().
     'F1_high': 'TP_Response_Inner_long_PM',
-    'F2_high': 'TP_response_Outer_long_PM',
+    'F2_high': 'TP_Response_Outer_long_PM',
     'F1_low': 'Inner_low_CB',
     'F2_low': 'Outer_low_CB',
     'F3': 'Test_pulse',
@@ -148,19 +191,18 @@ def _plot_high_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[fl
         fit = _fit_cb_curve(fit_x, fit_y)
         if fit is not None:
             x_fit, y_fit, (_, mean, sigma, alpha, n), pcov = fit
-            mean_err = float(np.sqrt(pcov[1, 1])) if pcov is not None and pcov.shape[0] > 1 else None
-            mean_map[f'{label}_high'] = (mean, mean_err)
+            mean_map[f'{label}_high'] = (mean, float(abs(sigma)))
             mean_mV = _to_millivolts_scalar(mean)
-            mean_err_mV = _to_millivolts_scalar(mean_err) if mean_err is not None else None
+            sigma_mV = _to_millivolts_scalar(float(abs(sigma)))
             ax.plot(
                 x_fit * MV_SCALE,
                 y_fit,
-                color=COLORS[label],
+                color='k',
                 linestyle='--',
                 label=(
                     f'{label_text} fit (mean={mean_mV:.2f}'
-                    + (f' ± {mean_err_mV:.2f}' if mean_err_mV is not None else '')
-                    + f' mV, alpha={alpha:.2f}, n={n:.1f})'
+                    + (f' ± {sigma_mV:.2f}' if sigma_mV is not None else '')
+                    + f' mV)'
                 ),
             )
         plotted = True
@@ -171,16 +213,14 @@ def _plot_high_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[fl
 
     ax.set_xlabel('Bin center [mV]')
     ax.set_ylabel('Counts')
-    ax.set_title('F1/F2 raw high region')
+    ax.set_title('Test Pulse response')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best')
     return mean_map
 
 
 def _plot_low_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[float, Optional[float]]]:
-    """
-    Low region: raw F1 and F2, no scaling/subtraction, fit CB in 0.4-1.2 V.
-    """
+    # Low region: raw F1 and F2, no scaling/subtraction, fit CB in 0.4-1.2 V.
     plotted = False
     mean_map: Dict[str, MeanWithErr] = {}
     for label in ('F1', 'F2'):
@@ -198,22 +238,21 @@ def _plot_low_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[flo
         fit = _fit_cb_curve(x, y)
         if fit is not None:
             x_fit, y_fit, (_, mean, sigma, alpha, n), pcov = fit
-            mean_err = float(np.sqrt(pcov[1, 1])) if pcov is not None and pcov.shape[0] > 1 else None
             mean_mV = _to_millivolts_scalar(mean)
-            mean_err_mV = _to_millivolts_scalar(mean_err) if mean_err is not None else None
+            sigma_mV = _to_millivolts_scalar(float(abs(sigma)))
             if label == 'F2' and mean_mV is not None and mean_mV < 600.0:
-                ax.plot([], [], ' ', label="F2 CB fit rejected (<600 mV)")
+                ax.plot([], [], ' ', label="F2 fit rejected (<600 mV)")
             else:
-                mean_map[f'{label}_low'] = (mean, mean_err)
+                mean_map[f'{label}_low'] = (mean, float(abs(sigma)))
                 ax.plot(
                     x_fit * MV_SCALE,
                     y_fit,
                     color='k',
                     linestyle='--',
                     label=(
-                        f"{DESCRIPTIONS[label]} CB fit (mean={mean_mV:.2f}"
-                        + (f' ± {mean_err_mV:.2f}' if mean_err_mV is not None else '')
-                        + f" mV, alpha={alpha:.2f}, n={n:.1f})"
+                        f"{DESCRIPTIONS[label]} fit (mean={mean_mV:.2f}"
+                        + (f' ± {sigma_mV:.2f}' if sigma_mV is not None else '')
+                        + " mV)"
                     ),
                 )
         plotted = True
@@ -223,22 +262,21 @@ def _plot_low_region(ax, series: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[flo
         return {}
     ax.set_xlabel('Bin center [mV]')
     ax.set_ylabel('Counts')
-    ax.set_title(f'Low region raw ({LOW_V_MIN:.1f}-{LOW_V_MAX:.1f} V)')
+    ax.set_title(f'Purity monitor ({LOW_V_MIN:.1f}-{LOW_V_MAX:.1f} V)')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=LOW_V_MIN * MV_SCALE, right=LOW_V_MAX * MV_SCALE)
     ax.legend(loc='best')
     return mean_map
 
 
-def _fit_f3_peak(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, float, Optional[float]]]:
+def _fit_f3_peak(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, float, float]]:
     res = fit_gaussian(x, y)
     if res is None:
         return None
     (amp, mean, sigma), pcov = res
     x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 400)
     y_fit = gaussian(x_fit, amp, mean, sigma)
-    mean_err = float(np.sqrt(pcov[1, 1])) if pcov is not None and pcov.shape[0] > 1 else None
-    return x_fit, y_fit, mean, mean_err
+    return x_fit, y_fit, mean, float(abs(sigma))
 
 
 def _plot_f3(ax, series: Dict[str, pd.DataFrame]) -> Optional[Tuple[float, Optional[float]]]:
@@ -254,23 +292,23 @@ def _plot_f3(ax, series: Dict[str, pd.DataFrame]) -> Optional[Tuple[float, Optio
     mean_err_val: Optional[float] = None
     fit = _fit_f3_peak(x, y)
     if fit is not None:
-        x_fit, y_fit, mean, mean_err = fit
+        x_fit, y_fit, mean, sigma = fit
         mean_val = mean
-        mean_err_val = mean_err
+        mean_err_val = sigma
         mean_mV = _to_millivolts_scalar(mean)
-        mean_err_mV = _to_millivolts_scalar(mean_err) if mean_err is not None else None
+        sigma_mV = _to_millivolts_scalar(sigma)
         ax.plot(
             x_fit * MV_SCALE,
             y_fit,
-            color='tab:purple',
+            color='k',
             linestyle='--',
             label=(
                 f'Peak fit (mean={mean_mV:.2f}'
-                + (f' ± {mean_err_mV:.2f}' if mean_err_mV is not None else '')
+                + (f' ± {sigma_mV:.2f}' if sigma_mV is not None else '')
                 + ' mV)'
             ),
         )
-    ax.set_xlim(170, 190)
+    ax.set_xlim(1100, 1400)
     ax.set_ylim(bottom=0)
     ax.set_xlabel('Bin center [mV]')
     ax.set_ylabel('Counts')
@@ -298,7 +336,7 @@ def plot_measurement(measurement_time: datetime, series: Dict[str, pd.DataFrame]
     os.makedirs(PLOTS_DIR, exist_ok=True)
     out_path = os.path.join(
         PLOTS_DIR,
-        f"split_low_cb_{measurement_time.strftime('%Y%m%d_%H%M%S')}.png"
+        f"scope_{measurement_time.strftime('%Y%m%d_%H%M%S')}.png"
     )
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -350,7 +388,7 @@ def _overlay_temperature(ax, temp_times, temp_vals, label_tracker: Dict[str, boo
     twin.grid(False)
 
 
-def plot_fit_means(mean_records: Dict[str, List[Tuple[datetime, float, Optional[float]]]]):
+def plot_fit_means(mean_records: Dict[str, List[Tuple[datetime, float, Optional[float]]]], show_band: bool = False):
     keys_present = any(mean_records.get(k) for k in DATA_LABELS.keys())
     if not keys_present:
         return
@@ -377,6 +415,7 @@ def plot_fit_means(mean_records: Dict[str, List[Tuple[datetime, float, Optional[
         start_time_candidates.append(plot_start)
     start_time = min(start_time_candidates) if start_time_candidates else None
 
+    # Optional temperature overlay (right axis). This is useful for diagnosing drifts.
     temp_times, temp_vals = _load_temperature_series(TEMP_CSV_PATH, start_time)
     temp_label_tracker = {}
 
@@ -384,15 +423,17 @@ def plot_fit_means(mean_records: Dict[str, List[Tuple[datetime, float, Optional[
         if not samples:
             ax.set_visible(False)
             return
+        ax.set_title(title)
         samples = sorted(samples, key=lambda x: x[0])
         times = [t for t, _, _ in samples]
         values = [v * MV_SCALE for _, v, _ in samples]
         errs = np.array([e * MV_SCALE if e is not None else np.nan for _, _, e in samples], dtype=float)
         ax.plot(times, values, marker='o', markersize=3.5, linestyle='none', color=color)
         finite_mask = np.isfinite(errs)
-        if finite_mask.any():
+        if finite_mask.any() and show_band:
             vals_arr = np.array(values, dtype=float)
-            band = 2.0 * errs
+            # Visualize uncertainty as a ±σ band (when covariance is available).
+            band = errs
             lower = vals_arr - band
             upper = vals_arr + band
             ax.fill_between(times, lower, upper, color=color, alpha=0.12, linewidth=0)
@@ -404,17 +445,18 @@ def plot_fit_means(mean_records: Dict[str, List[Tuple[datetime, float, Optional[
 
     _plot_series(ax_f1_high, filtered_records.get('F1_high', []), 'tab:blue', 'Inner long PM TP response')
     _plot_series(ax_f2_high, filtered_records.get('F2_high', []), 'tab:orange', 'Outer long PM TP response')
-    _plot_series(ax_f1_low, filtered_records.get('F1_low', []), 'tab:blue', 'Inner long PM low')
-    _plot_series(ax_f2_low, filtered_records.get('F2_low', []), 'tab:orange', 'Outer long PM low')
-    _plot_series(ax_f3, filtered_records.get('F3', []), 'tab:purple', 'Test pulse', ylim=(181.2, 183))
+    _plot_series(ax_f1_low, filtered_records.get('F1_low', []), 'tab:blue', 'Inner long PM')
+    _plot_series(ax_f2_low, filtered_records.get('F2_low', []), 'tab:orange', 'Outer long PM')
+    _plot_series(ax_f3, filtered_records.get('F3', []), 'tab:purple', 'Test pulse', ylim=(1215, 1230))
 
     axes[-1].set_xlabel('Measurement time')
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
     fig.autofmt_xdate()
     fig.tight_layout()
     out_path = os.path.join(PLOTS_DIR, 'fit_means_vs_time.png')
-    plt.show()
     fig.savefig(out_path, dpi=150)
+    if os.environ.get("TP_SHOW", "0") == "1":
+        plt.show()
     plt.close(fig)
     print(f"Saved mean-vs-time plot: {out_path}")
 
@@ -428,7 +470,7 @@ def write_plot_data(rows: List[Dict[str, RowValue]]):
         return ts if isinstance(ts, datetime) else datetime.min
 
     rows = sorted(rows, key=_row_timestamp)
-    data_path = os.path.join(PLOTS_DIR, 'fit_means_data_low_cb.csv')
+    data_path = os.path.join(PLOTS_DIR, 'fit_means_scope.csv')
     with open(data_path, 'w', newline='') as f:
         f.write("# Derived with low-region CB fits (no scaling)\n")
         f.write(f"# Generated at {datetime.now(timezone.utc).isoformat()}\n")
@@ -457,18 +499,32 @@ def write_plot_data(rows: List[Dict[str, RowValue]]):
 
 def main():
     os.makedirs(PLOTS_DIR, exist_ok=True)
+    plot_start, plot_end = _resolve_plot_window()
     directories: List[str] = sorted(iter_measurement_dirs(ROOT_DIR))
+    if not directories:
+        print(
+            f"No measurement directories found under ROOT_DIR='{ROOT_DIR}'. "
+            "Check NP02DATA_DIR or run from src/."
+        )
     mean_records: Dict[str, List[Tuple[datetime, float, Optional[float]]]] = {}
     data_rows: List[Dict[str, RowValue]] = []
-    for directory in directories:
-        measurement_time = parse_timestamp(directory)
-        if measurement_time is None or (PLOT_START and measurement_time < PLOT_START):
+    # Each item is either a Record_*.csv file (new format) or a legacy measurement directory.
+    for measurement in directories:
+        measurement_time = parse_timestamp(measurement)
+        if measurement_time is None:
             continue
-        series = {}
-        for label, fname in FILES.items():
-            df = load_histogram(os.path.join(directory, fname))
-            if df is not None:
-                series[label] = df
+        if plot_start and measurement_time < plot_start:
+            continue
+        if plot_end and measurement_time > plot_end:
+            continue
+        series: Dict[str, pd.DataFrame] = {}
+        if os.path.isfile(measurement) and os.path.basename(measurement).startswith("Record_") and measurement.lower().endswith(".csv"):
+            series = load_record_series(measurement)
+        else:
+            for label, fname in FILES.items():
+                df = load_histogram(os.path.join(measurement, fname))
+                if df is not None:
+                    series[label] = df
         if not series:
             continue
         means = plot_measurement(measurement_time, series)
